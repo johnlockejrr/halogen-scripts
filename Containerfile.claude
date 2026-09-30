@@ -1,0 +1,39 @@
+# Claude Code in a container, pointed at a halogen server on the host.
+#
+#   podman build -t claude-box -f Containerfile.claude .
+#
+# Node 22 is the LTS line Claude Code targets. Add whatever toolchain your
+# projects need below (python, go, rust...); the point is that the agent can
+# install and run things freely without touching the host.
+
+FROM docker.io/library/node:22-bookworm-slim
+
+ARG UID=1000
+ARG GID=1000
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git openssh-client ca-certificates curl less \
+      ripgrep fd-find jq \
+      build-essential python3 python3-venv python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Claude Code refuses --dangerously-skip-permissions as root, and files written
+# into the bind-mounted repo should belong to you, so run as a normal user whose
+# id matches yours on the host.
+RUN if getent passwd ${UID} >/dev/null; then userdel -r "$(getent passwd ${UID} | cut -d: -f1)"; fi \
+    && groupadd -g ${GID} dev 2>/dev/null || true \
+    && useradd -m -u ${UID} -g ${GID} -s /bin/bash dev
+
+# Global npm prefix inside the user's home so `npm i -g` works unprivileged
+# and survives as part of the persisted home volume.
+ENV NPM_CONFIG_PREFIX=/home/dev/.npm-global
+ENV PATH=/home/dev/.npm-global/bin:$PATH
+
+USER dev
+WORKDIR /workspace
+
+RUN mkdir -p /home/dev/.npm-global \
+    && npm install -g --ignore-scripts @anthropic-ai/claude-code
+
+ENTRYPOINT ["/bin/bash", "-lc"]
+CMD ["claude"]
