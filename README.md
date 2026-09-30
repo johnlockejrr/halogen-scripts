@@ -204,4 +204,4 @@ cd ../proj-refactor && claude-box.sh
 
 ## License
 
-MIT.
+Apache License 2.0
