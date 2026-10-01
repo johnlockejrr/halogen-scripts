@@ -9,6 +9,18 @@ MODEL_DIR="/mnt/data/models/halogen-qwen3.8-flash-next"
 CACHE_DIR="/mnt/data/halogen-cache"
 PORT=8731
 
+compact_memory() {
+  local before after
+  before=$(awk '/Normal/{print $14; exit}' /proc/buddyinfo)
+  sudo sysctl -q vm.compact_memory=1 2>/dev/null || {
+    echo "compaction skipped (no sudo); order-9 blocks: ${before:-?}" >&2
+    return 0
+  }
+  sleep 3
+  after=$(awk '/Normal/{print $14; exit}' /proc/buddyinfo)
+  echo "order-9 2MiB blocks: ${before:-?} -> ${after:-?}" >&2
+}
+
 latest_tag() {
   local token
   token=$(curl -fsSL "https://${REGISTRY}/token?scope=repository:${REPO}:pull" | jq -r .token)
@@ -35,8 +47,7 @@ clean() {
 run() {
   local tag="$1"; shift
 
-  sudo sysctl -q vm.compact_memory=1 2>/dev/null || true
-  sleep 2
+  compact_memory
 
   podman pull -q "${IMAGE}:${tag}" >/dev/null
   exec podman run --rm -p "${PORT}:${PORT}" \
@@ -52,6 +63,8 @@ run() {
 optimal_env() {
   local pool="$1"
   printf '%s\n' \
+    -e HALOGEN_MTP_PREFILL=0 \
+    -e HALOGEN_WEIGHTS_LOCK=1 \
     -e HALOGEN_CTX=262144 \
     -e "HALOGEN_KV_POOL_POSITIONS=${pool}" \
     -e HALOGEN_KV_SLOTS=4 \
@@ -86,17 +99,18 @@ run_optimal_vision() {
     -e HALOGEN_VISION_MAX_PIXELS=2073600
 }
 
-run_vision() {
-  run "$1" \
-    -e HALOGEN_VISION_TOWER=1
-}
-
-run_uncensored() {
-  run "$1" \
-    -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-uncensored-IQ4_XS.hgn \
-    -e HALOGEN_TOKENIZER=/models/tokenizer \
-    -e HALOGEN_MODEL_ID=qwen3.8-flash-uncensored \
-    -e HALOGEN_VISION_TOWER=/models/qwen38-flash-next-vision.hgn
+run_swift_abliterated() {
+  mkdir -p "${CACHE_DIR}-abl"
+  mapfile -t env_args < <(optimal_env 524288)
+  run "$1" -v "${CACHE_DIR}-abl:/cache" "${env_args[@]}" \
+    -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2-swift15-abliterated.hgn \
+    -e HALOGEN_NGRAM_TABLE=/models/qwen38-flash-next-ngram.hgn \
+    -e HALOGEN_MODEL_ID=halogen-qwen3.8-flash-next \
+    -e HALOGEN_SPEC_ADAPT=0 \
+    -e HALOGEN_TOP_P=0.95 \
+    -e HALOGEN_TOP_K=20 \
+    -e HALOGEN_VISION_TOWER=1 \
+    -e HALOGEN_VISION_MAX_PIXELS=2073600
 }
 
 resolve() {
@@ -114,13 +128,10 @@ case "${1:-run}" in
   run-optimal-vision)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal + vision)" >&2; clean "$tag"
     run_optimal_vision "$tag" ;;
-  run-vision)
-    tag=$(resolve); echo "using ${IMAGE}:${tag} (vision)" >&2; clean "$tag"
-    run_vision "$tag" ;;
-  run-uncensored)
-    tag=$(resolve); echo "using ${IMAGE}:${tag} (uncensored)" >&2; clean "$tag"
-    run_uncensored "$tag" ;;
+  run-swift-abliterated)
+    tag=$(resolve); echo "using ${IMAGE}:${tag} (swift abliterated)" >&2; clean "$tag"
+    run_swift_abliterated "$tag" ;;
   clean)  tag=$(resolve); clean "$tag" ;;
   latest) resolve ;;
-  *)      echo "usage: $0 [run|run-optimal|run-optimal-vision|run-vision|run-uncensored|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
+  *)      echo "usage: $0 [run|run-optimal|run-optimal-vision|run-swift-abliterated|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
 esac
