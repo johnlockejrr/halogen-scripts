@@ -9,9 +9,6 @@ MODEL_DIR="/mnt/data/models/halogen-qwen3.8-flash-next"
 CACHE_DIR="/mnt/data/halogen-cache"
 PORT=8731
 
-sudo sysctl -q vm.compact_memory=1 2>/dev/null || true
-sleep 2
-
 latest_tag() {
   local token
   token=$(curl -fsSL "https://${REGISTRY}/token?scope=repository:${REPO}:pull" | jq -r .token)
@@ -37,6 +34,10 @@ clean() {
 
 run() {
   local tag="$1"; shift
+
+  sudo sysctl -q vm.compact_memory=1 2>/dev/null || true
+  sleep 2
+
   podman pull -q "${IMAGE}:${tag}" >/dev/null
   exec podman run --rm -p "${PORT}:${PORT}" \
     --device /dev/kfd --device /dev/dri --group-add keep-groups \
