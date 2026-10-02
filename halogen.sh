@@ -8,6 +8,20 @@ IMAGE="${REGISTRY}/${REPO}"
 MODEL_DIR="/mnt/data/models/halogen-qwen3.8-flash-next"
 CACHE_DIR="/mnt/data/halogen-cache"
 PORT=8731
+KEEP_TAGS="${KEEP_TAGS:-0.15.3}"
+XRT_LIB_DIR="${XRT_LIB_DIR:-/usr/lib/x86_64-linux-gnu}"
+
+xrt_mounts() {
+  local f real
+  for f in libxrt_coreutil.so.2 libxrt_core.so.2 libxrt_driver_xdna.so.2; do
+    real=$(readlink -f "${XRT_LIB_DIR}/${f}") || return 1
+    [[ -e "$real" ]] || { echo "missing XRT library: ${XRT_LIB_DIR}/${f}" >&2; return 1; }
+    printf '%s\n' \
+      -v "${real}:/opt/xilinx/xrt/lib/${f}:ro" \
+      -v "${real}:${XRT_LIB_DIR}/${f}:ro" \
+      -v "${real}:/opt/xilinx${XRT_LIB_DIR#/usr}/${f}:ro"
+  done
+}
 
 compact_memory() {
   local before after
@@ -38,10 +52,13 @@ local_latest_tag() {
 
 clean() {
   local keep="$1"
+  local -a protect=("$keep")
+  IFS=, read -ra extra <<< "${KEEP_TAGS}"
+  protect+=("${extra[@]}")
   podman images --filter "reference=${IMAGE}" --format '{{.Tag}}' \
-    | grep -vxF "$keep" \
-    | xargs -r -I{} podman rmi "${IMAGE}:{}" || true   # skips images still in use
-  podman image prune -f >/dev/null                      # dangling layers
+    | grep -vxF -f <(printf '%s\n' "${protect[@]}") \
+    | xargs -r -I{} podman rmi "${IMAGE}:{}" || true
+  podman image prune -f >/dev/null
 }
 
 run() {
@@ -63,6 +80,7 @@ run() {
 optimal_env() {
   local pool="$1"
   printf '%s\n' \
+    -e HALOGEN_SPEC_ADAPT=0 \
     -e HALOGEN_MTP_PREFILL=0 \
     -e HALOGEN_WEIGHTS_LOCK=1 \
     -e HALOGEN_CTX=262144 \
@@ -113,6 +131,42 @@ run_swift_abliterated() {
     -e HALOGEN_VISION_MAX_PIXELS=2073600
 }
 
+run_optimal_npu() {
+  mkdir -p "${CACHE_DIR}"
+  [[ -e /dev/accel/accel0 ]] || { echo "no /dev/accel/accel0 — NPU driver missing, or amd_iommu=off" >&2; exit 1; }
+  mapfile -t env_args < <(optimal_env 524288)
+  mapfile -t xrt_args < <(xrt_mounts) || exit 1
+  run "$1" \
+    -v "${CACHE_DIR}:/cache" \
+    --device /dev/accel/accel0 \
+    "${xrt_args[@]}" \
+    "${env_args[@]}" \
+    -e HALOGEN_NPU_MODELS=qwen3-embedding-0.6b,qwen3-reranker-0.6b,decider-0.8b \
+    -e HALOGEN_VISION_TOWER=1 \
+    -e HALOGEN_VISION_MAX_PIXELS=2073600
+}
+
+run_optimal_ht43() {
+  mkdir -p "${CACHE_DIR}-ht43"
+  mapfile -t env_args < <(optimal_env 786432)
+  run "$1" -v "${CACHE_DIR}-ht43:/cache" "${env_args[@]}" \
+    -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-ht43.hgn
+}
+
+run_optimal_npu_ht43() {
+  mkdir -p "${CACHE_DIR}-ht43"
+  [[ -e /dev/accel/accel0 ]] || { echo "no /dev/accel/accel0" >&2; exit 1; }
+  mapfile -t env_args < <(optimal_env 786432)
+  mapfile -t xrt_args < <(xrt_mounts) || exit 1
+  run "$1" \
+    -v "${CACHE_DIR}-ht43:/cache" \
+    --device /dev/accel/accel0 \
+    "${xrt_args[@]}" \
+    "${env_args[@]}" \
+    -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-ht43.hgn \
+    -e HALOGEN_NPU_MODELS=qwen3-embedding-0.6b,qwen3-reranker-0.6b,decider-0.8b
+}
+
 resolve() {
   if [[ -n "${VERSION:-}" ]]; then echo "$VERSION"; return; fi
   latest_tag 2>/dev/null || { echo "registry unreachable, using local image" >&2; local_latest_tag; }
@@ -131,7 +185,16 @@ case "${1:-run}" in
   run-swift-abliterated)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (swift abliterated)" >&2; clean "$tag"
     run_swift_abliterated "$tag" ;;
+  run-optimal-npu)
+    tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal + npu)" >&2; clean "$tag"
+    run_optimal_npu "$tag" ;;
+  run-optimal-ht43)
+    tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal + ht43)" >&2; clean "$tag"
+    run_optimal_ht43 "$tag" ;;
+  run-optimal-npu-ht43)
+    tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal + npu + ht43)" >&2; clean "$tag"
+    run_optimal_npu_ht43 "$tag" ;;
   clean)  tag=$(resolve); clean "$tag" ;;
   latest) resolve ;;
-  *)      echo "usage: $0 [run|run-optimal|run-optimal-vision|run-swift-abliterated|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
+  *)      echo "usage: $0 [run|run-optimal|run-optimal-vision|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-swift-abliterated|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
 esac
