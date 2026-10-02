@@ -26,6 +26,7 @@ xrt_mounts() {
 compact_memory() {
   local before after
   before=$(awk '/Normal/{print $14; exit}' /proc/buddyinfo)
+  sync
   sudo sysctl -q vm.compact_memory=1 2>/dev/null || {
     echo "compaction skipped (no sudo); order-9 blocks: ${before:-?}" >&2
     return 0
