@@ -23,6 +23,52 @@ xrt_mounts() {
   done
 }
 
+# Everything the NPU profiles need, checked before the image is pulled so a
+# missing piece costs a second rather than a four-minute weight load.
+require_npu() {
+  local ok=1 f
+
+  if [[ ! -e /dev/accel/accel0 ]]; then
+    echo "NPU: /dev/accel/accel0 is missing." >&2
+    if grep -qw 'amd_iommu=off' /proc/cmdline; then
+      echo "     amd_iommu=off is on the kernel command line; the amdxdna driver needs an IOMMU." >&2
+      echo "     sudo kernelstub -d 'amd_iommu=off' && sudo kernelstub -a 'iommu=pt' && sudo reboot" >&2
+    else
+      echo "     The amdxdna driver is not loaded. Check: modinfo amdxdna; dmesg | grep -i amdxdna" >&2
+    fi
+    ok=0
+  fi
+
+  for f in libxrt_coreutil.so.2 libxrt_core.so.2 libxrt_driver_xdna.so.2; do
+    if [[ ! -e "${XRT_LIB_DIR}/${f}" ]]; then
+      echo "NPU: XRT library ${XRT_LIB_DIR}/${f} not found." >&2
+      echo "     Install XRT with its NPU plugin, or set XRT_LIB_DIR to where yours lives." >&2
+      ok=0
+    fi
+  done
+
+  # The fabric clock must be held, or GPU and NPU work together can hang the box.
+  if command -v halogen-fabric-clock >/dev/null 2>&1; then
+    if ! halogen-fabric-clock status 2>/dev/null | grep -q held; then
+      echo "NPU: the GPU fabric clock is not held — the server will refuse to start." >&2
+      echo "     sudo systemctl enable --now halogen-fabric-clock.service" >&2
+      ok=0
+    fi
+  else
+    echo "NPU: halogen-fabric-clock not installed; the server may refuse to start." >&2
+    echo "     See deploy/host/ in the halogen-flash-server repo." >&2
+  fi
+
+  # The device is root:render; rootless podman reaches it through keep-groups.
+  if [[ -e /dev/accel/accel0 ]] && ! id -nG | tr ' ' '\n' | grep -qx render; then
+    echo "NPU: your user is not in the 'render' group; --group-add keep-groups will not reach the device." >&2
+    echo "     sudo usermod -aG render \$USER   (then log out and back in)" >&2
+    ok=0
+  fi
+
+  [[ "$ok" == 1 ]] || { echo "NPU preflight failed; refusing to start." >&2; exit 1; }
+}
+
 compact_memory() {
   local before after
   before=$(awk '/Normal/{print $14; exit}' /proc/buddyinfo)
@@ -134,7 +180,7 @@ run_swift_abliterated() {
 
 run_optimal_npu() {
   mkdir -p "${CACHE_DIR}"
-  [[ -e /dev/accel/accel0 ]] || { echo "no /dev/accel/accel0 — NPU driver missing, or amd_iommu=off" >&2; exit 1; }
+  require_npu
   mapfile -t env_args < <(optimal_env 524288)
   mapfile -t xrt_args < <(xrt_mounts) || exit 1
   run "$1" \
@@ -156,7 +202,7 @@ run_optimal_ht43() {
 
 run_optimal_npu_ht43() {
   mkdir -p "${CACHE_DIR}-ht43"
-  [[ -e /dev/accel/accel0 ]] || { echo "no /dev/accel/accel0" >&2; exit 1; }
+  require_npu
   mapfile -t env_args < <(optimal_env 786432)
   mapfile -t xrt_args < <(xrt_mounts) || exit 1
   run "$1" \
