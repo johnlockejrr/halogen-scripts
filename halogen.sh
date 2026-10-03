@@ -188,7 +188,7 @@ run_optimal_npu() {
     --device /dev/accel/accel0 \
     "${xrt_args[@]}" \
     "${env_args[@]}" \
-    -e HALOGEN_NPU_MODELS=qwen3-embedding-0.6b,qwen3-reranker-0.6b,decider-0.8b \
+    -e HALOGEN_NPU_MODELS=qwen3-embedding-0.6b,qwen3-reranker-0.6b,decider-0.8b,qwen3guard-gen-0.6b,qwen3.5-2b \
     -e HALOGEN_VISION_TOWER=1 \
     -e HALOGEN_VISION_MAX_PIXELS=2073600
 }
@@ -211,7 +211,7 @@ run_optimal_npu_ht43() {
     "${xrt_args[@]}" \
     "${env_args[@]}" \
     -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-ht43.hgn \
-    -e HALOGEN_NPU_MODELS=qwen3-embedding-0.6b,qwen3-reranker-0.6b,decider-0.8b
+    -e HALOGEN_NPU_MODELS=qwen3-embedding-0.6b,qwen3-reranker-0.6b,decider-0.8b,qwen3guard-gen-0.6b,qwen3.5-2b
 }
 
 resolve() {
