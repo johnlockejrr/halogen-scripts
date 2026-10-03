@@ -36,7 +36,7 @@ claude
 
 ```
 usage: ./halogen.sh [run|run-optimal|run-optimal-vision|run-optimal-npu
-                    |run-optimal-ht43|run-optimal-npu-ht43
+                    |run-optimal-ht43|run-optimal-npu-ht43|run-optimal-slots8
                     |run-swift-abliterated|clean|latest]   (VERSION=x.y.z to pin)
 ```
 
@@ -48,6 +48,7 @@ usage: ./halogen.sh [run|run-optimal|run-optimal-vision|run-optimal-npu
 | `run-optimal-npu` | v2 | 524288 | vision + 5 NPU models |
 | `run-optimal-ht43` | ht43 | 786432 | the smaller checkpoint |
 | `run-optimal-npu-ht43` | ht43 | 786432 | both |
+| `run-optimal-slots8` | v2 | 786432 | 8 KV slots — for heavy subagent fan-out |
 | `run-swift-abliterated` | abliterated v2 | 524288 | vision |
 
 The tag is resolved from GHCR each run, falling back to the newest local image if the
@@ -160,6 +161,27 @@ case the adaptive policy exists for showed no difference at all on this corpus.
 
 Both runs truncated 27-29% of passes at `max_tokens`, so they measure answer decode with
 thinking mostly off. Fine for comparing two configurations, not a picture of a real turn.
+
+### Concurrency, and the 4-slot cliff
+
+`KV_SLOTS=4` (the `run-optimal` default) collapses when a 5th request arrives.
+`run-optimal-slots8` is the same profile with 8 slots. BetterBench concurrency phase,
+0.16.2, v2, pool 786432:
+
+| concurrent | 4 slots: aggregate / TTFT p50 | **8 slots: aggregate / TTFT p50** |
+|--:|---|---|
+| 1 | 47.2 t/s / 339 ms | 44.4 / 448 ms |
+| 2 | 53.5 / 411 ms | 52.1 / 440 ms |
+| 4 | 69.5 / 419 ms | 67.4 / 441 ms |
+| **8** | 69.7 / **13,048 ms** | **81.0 / 509 ms** |
+
+At 8 concurrent, 8 slots is **+16% aggregate and 25x better TTFT** — the 5th through 8th
+requests no longer queue. The cost is ~2-3% at levels 1-4 and about 100 ms of TTFT
+throughout, plus 0.5 GiB held (92.3 vs 91.8) and a prompt cache of 64 entries rather
+than 32.
+
+Worth it only if your harness actually exceeds four concurrent calls. Claude Code with
+subagents can; a single stream never will.
 
 ---
 
