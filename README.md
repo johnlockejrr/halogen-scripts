@@ -69,7 +69,7 @@ magnitude, so it is for correlation after a bad start, not for prediction.
 | `HALOGEN_KV_POOL_POSITIONS` | `786432` | 3 full-length conversations; at `524288` a parent plus subagents fills the pool and `max_tokens` is clamped every turn |
 | `HALOGEN_KV_SLOTS` | `4` | agents fan out into parallel subagent calls |
 | `HALOGEN_MAX_TOK` | `16384` | **measured**: 32768 costs 19% of prefill on this box, 8192 gains nothing |
-| `HALOGEN_SPEC_ADAPT` | `0` | keeps the MTP draft head on for every token; the adaptive policy can switch it off for whole requests |
+| `HALOGEN_SPEC_ADAPT` | `0` | **measured -33% TTFT** (363 -> 245 ms p50) against the adaptive default. The policy reads acceptance over a 32-round window before deciding, and that costs the first rounds of every request. Decode unchanged within noise |
 | `HALOGEN_MTP_PREFILL` | `0` | **measured +3% @32k, +7% @6.2k**; speculation cannot help during prefill, where every token is known. Undocumented in `FLAGS.md` — re-check after upgrades |
 | `HALOGEN_WEIGHTS_LOCK` | `1` | mlocks the weight pages. Without it, reclaim makes the GPU driver tear down and restore mappings, which can stall or fault |
 | `HALOGEN_HOST_RESERVE_GIB` | `24` | page cache for the 47.7 GiB n-gram table, which is read from disk and never held. Raising it to 32 was measured and changed nothing |
@@ -120,6 +120,7 @@ On **0.16.1**, which claims faster decode on both checkpoints:
 |---|---|
 | `amd_iommu=off` instead of `iommu=pt` | **+5% prefill**, but the NPU stops working |
 | `HALOGEN_MTP_PREFILL=0` | **+3% @32k, +7% @6.2k** |
+| `HALOGEN_SPEC_ADAPT=0` | **-33% TTFT**; decode +1.2%, inside noise |
 | `HALOGEN_MAX_TOK=32768` | **-19% prefill** |
 | `HALOGEN_MAX_TOK=8192` | no change |
 | CPU governor `performance` | 0.8% — noise |
@@ -134,6 +135,31 @@ On **0.16.1**, which claims faster decode on both checkpoints:
 - **Greedy + prompt lookup at 118k context: 68.4 tok/s**, with 1,450 of 1,495 drafted tokens accepted. Only available on `temperature: 0`, so not on the sampled production setting.
 - **Decode falls with context**: 43 at short, 41.5 @24k, 36 @74k.
 - **MTP speculates only while a request is alone.** At 4 concurrent each stream drops to ~18 tok/s with the head off; aggregate still rises to ~74.
+
+### Per-category decode (BetterBench, corpus v1.0, 20 passes)
+
+Two sequential runs, decode phase only, 0.16.2. `spec_adapt=0` is the shipped setting.
+
+| category | adaptive (default) | **spec_adapt=0** |
+|---|---|---|
+| chat | 49.6 | 48.8 |
+| code | 51.8 | **52.7** |
+| file_edit | 50.4 | **51.0** |
+| json | 50.9 | **51.5** |
+| math | 53.2 | 53.1 |
+| prose | 43.8 | 43.8 |
+| reasoning | 44.6 | **45.5** |
+| summarization | 46.9 | **47.3** |
+| **combined** | 48.4 | **49.0** |
+| **TTFT p50** | 363 ms | **245 ms** |
+| **TTFA p50** | ~1,050 ms | **~930 ms** |
+
+The decode difference is inside the noise band; the TTFT difference is not, and it is
+consistent across every category. Note prose is identical to one decimal both ways — the
+case the adaptive policy exists for showed no difference at all on this corpus.
+
+Both runs truncated 27-29% of passes at `max_tokens`, so they measure answer decode with
+thinking mostly off. Fine for comparing two configurations, not a picture of a real turn.
 
 ---
 
