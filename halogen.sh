@@ -156,6 +156,13 @@ run_optimal() {
   run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}"
 }
 
+run_optimal_slots8() {
+  mkdir -p "${CACHE_DIR}-s8"
+  mapfile -t env_args < <(optimal_env 786432)
+  run "$1" -v "${CACHE_DIR}-s8:/cache" "${env_args[@]}" \
+    -e HALOGEN_KV_SLOTS=8
+}
+
 run_optimal_vision() {
   mkdir -p "${CACHE_DIR}"
   mapfile -t env_args < <(optimal_env 524288)
@@ -171,7 +178,6 @@ run_swift_abliterated() {
     -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2-swift15-abliterated.hgn \
     -e HALOGEN_NGRAM_TABLE=/models/qwen38-flash-next-ngram.hgn \
     -e HALOGEN_MODEL_ID=halogen-qwen3.8-flash-next \
-    -e HALOGEN_SPEC_ADAPT=0 \
     -e HALOGEN_TOP_P=0.95 \
     -e HALOGEN_TOP_K=20 \
     -e HALOGEN_VISION_TOWER=1 \
@@ -226,6 +232,9 @@ case "${1:-run}" in
   run-optimal)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal)" >&2; clean "$tag"
     run_optimal "$tag" ;;
+  run-optimal-slots8)
+    tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal slots8)" >&2; clean "$tag"
+    run_optimal_slots8 "$tag" ;;
   run-optimal-vision)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal + vision)" >&2; clean "$tag"
     run_optimal_vision "$tag" ;;
@@ -243,5 +252,5 @@ case "${1:-run}" in
     run_optimal_npu_ht43 "$tag" ;;
   clean)  tag=$(resolve); clean "$tag" ;;
   latest) resolve ;;
-  *)      echo "usage: $0 [run|run-optimal|run-optimal-vision|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-swift-abliterated|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
+  *)      echo "usage: $0 [run|run-optimal|run-optimal-slots8|run-optimal-vision|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-swift-abliterated|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
 esac
