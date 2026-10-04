@@ -26,8 +26,8 @@ import argparse
 import json
 import os
 import re
-import shutil
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
@@ -41,8 +41,252 @@ STATE = {
     "profile": None,
     "started": None,
     "logfile": None,
+    "run_id": None,
+    "stop_evt": None,
 }
+HIST: "History | None" = None
 LOCK = threading.Lock()
+
+
+
+# ----------------------------------------------------------------- history
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+  id INTEGER PRIMARY KEY,
+  profile TEXT, checkpoint TEXT, pool TEXT, slots TEXT, ctx TEXT,
+  vision INT, npu TEXT, image_tag TEXT, engine_version TEXT,
+  started_at REAL, stopped_at REAL, duration_s REAL,
+  weights_gib REAL, held_gib REAL, pin_gbs REAL, pin_stalls INT,
+  ready_s REAL, logfile TEXT, stop_reason TEXT
+);
+CREATE TABLE IF NOT EXISTS reqs (
+  id INTEGER PRIMARY KEY, run_id INT, ts REAL,
+  out_tokens INT, secs REAL, tps REAL, rounds INT, commit_rate REAL,
+  prompt INT, cached INT, cached_pct REAL, prefill_s REAL,
+  pool_used INT, pool_total INT, closed_by TEXT
+);
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY, run_id INT, ts REAL, kind TEXT, detail TEXT
+);
+CREATE TABLE IF NOT EXISTS samples (
+  id INTEGER PRIMARY KEY, run_id INT, ts REAL,
+  mem_avail_mib INT, order9 INT, pool_used INT, pool_total INT,
+  hit_rate REAL, disk_records INT
+);
+CREATE INDEX IF NOT EXISTS reqs_run ON reqs(run_id);
+CREATE INDEX IF NOT EXISTS events_run ON events(run_id);
+CREATE INDEX IF NOT EXISTS samples_run ON samples(run_id);
+"""
+
+
+class History:
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path), check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript(SCHEMA)
+        self.db.commit()
+        self.lock = threading.Lock()
+        # any run left open by a crash is closed on startup
+        with self.lock:
+            self.db.execute(
+                "UPDATE runs SET stopped_at=COALESCE(stopped_at, started_at),"
+                " stop_reason=COALESCE(stop_reason,'interrupted') WHERE stopped_at IS NULL")
+            self.db.commit()
+
+    def begin(self, profile: str, info: dict, logfile: str) -> int:
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT INTO runs (profile,checkpoint,pool,slots,ctx,vision,npu,"
+                "started_at,logfile) VALUES (?,?,?,?,?,?,?,?,?)",
+                (profile, info.get("checkpoint"), str(info.get("pool")),
+                 str(info.get("slots")), str(info.get("ctx")),
+                 int(bool(info.get("vision"))), ",".join(info.get("npu") or []),
+                 time.time(), logfile))
+            self.db.commit()
+            return cur.lastrowid
+
+    def end(self, run_id: int, reason: str):
+        with self.lock:
+            self.db.execute(
+                "UPDATE runs SET stopped_at=?, duration_s=?-started_at, stop_reason=?"
+                " WHERE id=? AND stopped_at IS NULL",
+                (time.time(), time.time(), reason, run_id))
+            self.db.commit()
+
+    def set(self, run_id: int, **cols):
+        if not cols:
+            return
+        sets = ",".join(f"{k}=?" for k in cols)
+        with self.lock:
+            self.db.execute(f"UPDATE runs SET {sets} WHERE id=?",
+                            (*cols.values(), run_id))
+            self.db.commit()
+
+    def add_req(self, run_id: int, r: dict):
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO reqs (run_id,ts,out_tokens,secs,tps,rounds,commit_rate,"
+                "prompt,cached,cached_pct,prefill_s,pool_used,pool_total,closed_by)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, time.time(), r.get("out"), r.get("secs"), r.get("tps"),
+                 r.get("rounds"), r.get("commit"), r.get("prompt"), r.get("cached"),
+                 r.get("cached_pct"), r.get("prefill_s"), r.get("pool_used"),
+                 r.get("pool_total"), r.get("closed_by")))
+            self.db.commit()
+
+    def add_event(self, run_id: int, kind: str, detail: str):
+        with self.lock:
+            self.db.execute("INSERT INTO events (run_id,ts,kind,detail) VALUES (?,?,?,?)",
+                            (run_id, time.time(), kind, detail[:500]))
+            self.db.commit()
+
+    def add_sample(self, run_id: int, s: dict):
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO samples (run_id,ts,mem_avail_mib,order9,pool_used,"
+                "pool_total,hit_rate,disk_records) VALUES (?,?,?,?,?,?,?,?)",
+                (run_id, time.time(), s.get("mem"), s.get("order9"), s.get("pool_used"),
+                 s.get("pool_total"), s.get("hit_rate"), s.get("records")))
+            self.db.commit()
+
+    def runs(self, limit=60) -> list[dict]:
+        q = """SELECT r.*,
+                 (SELECT COUNT(*) FROM reqs q WHERE q.run_id=r.id) AS n_req,
+                 (SELECT SUM(out_tokens) FROM reqs q WHERE q.run_id=r.id) AS tokens,
+                 (SELECT ROUND(AVG(tps),1) FROM reqs q WHERE q.run_id=r.id) AS avg_tps,
+                 (SELECT MAX(prompt) FROM reqs q WHERE q.run_id=r.id) AS max_prompt,
+                 (SELECT COUNT(*) FROM events e WHERE e.run_id=r.id
+                    AND e.kind IN ('error','clamped','cannot_grow')) AS n_err
+               FROM runs r ORDER BY r.id DESC LIMIT ?"""
+        with self.lock:
+            return [dict(x) for x in self.db.execute(q, (limit,))]
+
+    def run(self, run_id: int) -> dict:
+        with self.lock:
+            r = self.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not r:
+                return {}
+            reqs = [dict(x) for x in self.db.execute(
+                "SELECT * FROM reqs WHERE run_id=? ORDER BY id DESC LIMIT 500", (run_id,))]
+            evs = [dict(x) for x in self.db.execute(
+                "SELECT * FROM events WHERE run_id=? ORDER BY id DESC LIMIT 200", (run_id,))]
+            sam = [dict(x) for x in self.db.execute(
+                "SELECT * FROM samples WHERE run_id=? ORDER BY id", (run_id,))]
+        return {"run": dict(r), "reqs": reqs, "events": evs, "samples": sam}
+
+
+# Lines halogen writes that are worth keeping.
+RE_MTP = re.compile(
+    r"mtp (?P<out>\d+) tok in (?P<secs>[\d.]+)s = (?P<tps>[\d.]+) t/s"
+    r"(?:.*?(?P<rounds>\d+) rounds, commit (?P<commit>[\d.]+)/round)?"
+    r".*?prompt (?P<prompt>\d+)(?: \((?P<cached>\d+) cached, (?P<cpct>[\d.]+)%\))?"
+    r"(?:, prefill (?P<prefill>[\d.]+)s)?"
+    r".*?(?:pool (?P<pused>\d+)/(?P<ptot>\d+))?"
+    r"(?:.*?closed at \d+ by (?P<closed>[a-z_ ]+))?")
+RE_POOL = re.compile(r"pool (?P<used>\d+)/(?P<tot>\d+)")
+RE_HTTP = re.compile(r'"(?:POST|GET) (?P<path>\S+) HTTP/1.1" (?P<code>\d{3})')
+RE_VER = re.compile(r"serve_api: version (?P<v>[\d.]+), engine version")
+RE_CKPT = re.compile(r"halogen: (?P<p>/models/\S+\.hgn) carries its own")
+RE_MEM = re.compile(r"memory: (?P<w>[\d.]+) GiB of weights locked in RAM.*?"
+                    r"(?P<all>[\d.]+) GiB in all")
+RE_PIN = re.compile(r"pinned [\d.]+ GiB in \d+ range\(s\) in [\d.]+ s "
+                    r"\((?P<gbs>[\d.]+) GB/s\)")
+RE_STALL = re.compile(r"(?P<n>\d+) compaction stalls during that step")
+RE_READY = re.compile(r"halogen: engine listening after (?P<s>\d+)s")
+RE_IMG = re.compile(r"using \S+:(?P<tag>[\d.]+)")
+
+
+class LogWatcher(threading.Thread):
+    """Follows the run's log, files per-request rows and notable events."""
+
+    def __init__(self, hist: History, run_id: int, logfile: Path, stop_evt):
+        super().__init__(daemon=True)
+        self.h, self.run_id, self.lf, self.stop = hist, run_id, logfile, stop_evt
+
+    def run(self):
+        pos, stalls = 0, 0
+        while not self.stop.is_set():
+            try:
+                if self.lf.exists():
+                    with open(self.lf, "rb") as fh:
+                        fh.seek(pos)
+                        chunk = fh.read()
+                        pos = fh.tell()
+                    for line in chunk.decode("utf-8", "replace").splitlines():
+                        self.line(line)
+            except Exception:
+                pass
+            self.stop.wait(1.0)
+
+    def line(self, line: str):
+        h, rid = self.h, self.run_id
+        if "serve_api: mtp" in line:
+            m = RE_MTP.search(line)
+            if m:
+                g = m.groupdict()
+                h.add_req(rid, {
+                    "out": int(g["out"]), "secs": float(g["secs"]),
+                    "tps": float(g["tps"]),
+                    "rounds": int(g["rounds"]) if g["rounds"] else None,
+                    "commit": float(g["commit"]) if g["commit"] else None,
+                    "prompt": int(g["prompt"]),
+                    "cached": int(g["cached"]) if g["cached"] else 0,
+                    "cached_pct": float(g["cpct"]) if g["cpct"] else 0.0,
+                    "prefill_s": float(g["prefill"]) if g["prefill"] else None,
+                    "pool_used": int(pm.group("used")) if (pm := RE_POOL.search(line)) else None,
+                    "pool_total": int(pm.group("tot")) if pm else None,
+                    "closed_by": (g["closed"] or "").strip() or None})
+            return
+        m = RE_HTTP.search(line)
+        if m and m.group("code") != "200":
+            h.add_event(rid, "error", f'{m.group("code")} {m.group("path")}')
+            return
+        for kind, needle in (("clamped", "max_tokens clamped"),
+                             ("cannot_grow", "cannot grow"),
+                             ("warning", "WARNING")):
+            if needle in line:
+                h.add_event(rid, kind, line.strip())
+                break
+        for rx, col, cast in ((RE_VER, "engine_version", str),
+                              (RE_IMG, "image_tag", str),
+                              (RE_READY, "ready_s", float),
+                              (RE_PIN, "pin_gbs", float)):
+            m = rx.search(line)
+            if m:
+                h.set(rid, **{col: cast(list(m.groupdict().values())[0])})
+        m = RE_MEM.search(line)
+        if m:
+            h.set(rid, weights_gib=float(m.group("w")), held_gib=float(m.group("all")))
+        m = RE_STALL.search(line)
+        if m:
+            h.set(rid, pin_stalls=int(m.group("n")))
+
+
+class Sampler(threading.Thread):
+    """Periodic snapshot of host memory and the server's own cache counters."""
+
+    def __init__(self, hist: History, run_id: int, port: str, stop_evt, every=30):
+        super().__init__(daemon=True)
+        self.h, self.rid, self.port, self.stop, self.every = hist, run_id, port, stop_evt, every
+
+    def run(self):
+        while not self.stop.is_set():
+            self.stop.wait(self.every)
+            if self.stop.is_set():
+                break
+            try:
+                r = resources()
+                c = http_json(f"http://127.0.0.1:{self.port}/cache") or {}
+                pool = c.get("pool") or {}
+                self.h.add_sample(self.rid, {
+                    "mem": r["mem_mib"].get("MemAvailable"),
+                    "order9": r.get("order9_blocks"),
+                    "pool_used": pool.get("used"), "pool_total": pool.get("positions"),
+                    "hit_rate": c.get("token_hit_rate"),
+                    "records": (c.get("disk") or {}).get("records")})
+            except Exception:
+                pass
 
 
 # ------------------------------------------------------------------ script
@@ -148,7 +392,7 @@ class Script:
 def container(script: Script) -> dict | None:
     img = script.vars.get("IMAGE", "halogen")
     rc, out = sh(["podman", "ps", "--filter", f"ancestor={img}",
-                  "--format", "{{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}"])
+                  "--format", "{{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}"], 5)
     if rc != 0:
         return None
     for line in out.strip().splitlines():
@@ -159,7 +403,7 @@ def container(script: Script) -> dict | None:
     return None
 
 
-def http_json(url: str, timeout: float = 2):
+def http_json(url: str, timeout: float = 1.5):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return json.load(r)
@@ -185,17 +429,42 @@ def resources() -> dict:
                 break
     except Exception:
         pass
-    gpu = {}
-    if shutil.which("rocm-smi"):
-        rc, out = sh(["rocm-smi", "--showmeminfo", "vram", "--showuse", "--csv"], 6)
-        if rc == 0:
-            for line in out.splitlines():
-                if "," in line and line[0].isalpha() is False:
-                    pass
-            gpu["raw"] = out.strip().splitlines()[-3:]
     load = os.getloadavg()
     return {"mem_mib": mem, "order9_blocks": frag,
-            "load": [round(x, 2) for x in load], "gpu": gpu}
+            "load": [round(x, 2) for x in load]}
+
+
+_VER = {"latest": None, "at": 0.0, "busy": False}
+
+
+def _refresh_latest(script: "Script"):
+    """Ask the registry for the newest tag. Slow, so it never runs inline."""
+    try:
+        rc, out = sh(["bash", str(script.path), "latest"], 25)
+        m = re.search(r"\bv?\d+\.\d+\.\d+\b", out) if rc == 0 else None
+        _VER["latest"] = m.group(0) if m else None
+    except Exception:
+        pass
+    finally:
+        _VER["at"] = time.time()
+        _VER["busy"] = False
+
+
+def versions(script: "Script", running_image: str | None) -> dict:
+    """Running tag from the container image; newest tag from a cached lookup."""
+    run_tag = (running_image.rsplit(":", 1)[1]
+               if running_image and ":" in running_image else None)
+    rc, out = sh(["podman", "images", "--filter",
+                  f"reference={script.vars.get('IMAGE','')}", "--format", "{{.Tag}}"], 5)
+    local = []
+    if rc == 0:
+        local = sorted({t.strip() for t in out.split()
+                        if re.fullmatch(r"v?[\d.]+", t.strip())},
+                       key=lambda t: [int(x) for x in t.lstrip("v").split(".")])
+    if not _VER["busy"] and time.time() - _VER["at"] > 900:
+        _VER["busy"] = True
+        threading.Thread(target=_refresh_latest, args=(script,), daemon=True).start()
+    return {"running": run_tag, "local": local, "latest": _VER["latest"]}
 
 
 # ------------------------------------------------------------------- run
@@ -214,7 +483,14 @@ def start(script: Script, profile: str, logdir: Path) -> tuple[bool, str]:
             stdout=fh, stderr=subprocess.STDOUT,
             start_new_session=True, cwd=str(script.path.parent),
         )
-        STATE.update(proc=proc, profile=profile, started=time.time(), logfile=str(lf))
+        run_id, stop_evt = None, threading.Event()
+        if HIST:
+            info = next((p for p in script.profiles if p["name"] == profile), {})
+            run_id = HIST.begin(profile, info, str(lf))
+            LogWatcher(HIST, run_id, lf, stop_evt).start()
+            Sampler(HIST, run_id, script.vars.get("PORT", "8731"), stop_evt).start()
+        STATE.update(proc=proc, profile=profile, started=time.time(),
+                     logfile=str(lf), run_id=run_id, stop_evt=stop_evt)
         return True, str(lf)
 
 
@@ -232,12 +508,18 @@ def stop(script: Script) -> tuple[bool, str]:
                 msgs.append("signalled the launcher")
             except Exception as e:
                 msgs.append(f"launcher: {e}")
-        STATE.update(proc=None, profile=None, started=None)
+        if STATE.get("stop_evt"):
+            STATE["stop_evt"].set()
+        if HIST and STATE.get("run_id"):
+            time.sleep(1.2)                      # let the watcher drain the tail
+            HIST.end(STATE["run_id"], "stopped")
+        STATE.update(proc=None, profile=None, started=None,
+                     run_id=None, stop_evt=None)
     return True, "; ".join(msgs) or "nothing was running"
 
 
 # ------------------------------------------------------------------- http
-PAGE = """<!doctype html><meta charset=utf-8><title>halogen</title>
+PAGE = r"""<!doctype html><meta charset=utf-8><title>halogen</title>
 <style>
  body{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#0f1115;color:#dfe3ea}
  header{padding:14px 22px;border-bottom:1px solid #222733;display:flex;gap:18px;align-items:center}
@@ -264,11 +546,19 @@ PAGE = """<!doctype html><meta charset=utf-8><title>halogen</title>
  td{padding:3px 0;border-bottom:1px solid #1c212c}
  td:last-child{text-align:right;color:#9fb0c8}
  .warn{color:#f0c674}
+ .run{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:7px 8px;
+      border:1px solid #242a38;border-radius:7px;margin-bottom:6px;cursor:pointer;
+      font:11px ui-monospace,monospace}
+ .run:hover{background:#1a1f2b}
+ .run .t{color:#9fb0c8}
+ .run .s{color:#7c879b}
+ .err{color:#f0a0ae}
 </style>
 <header>
   <h1>halogen</h1>
   <span id=state class="pill down">checking…</span>
   <span id=health class="pill"></span>
+  <span id=ver class="pill"></span>
   <span style=flex:1></span>
   <button class=stop id=stopbtn disabled>Stop</button>
 </header>
@@ -277,8 +567,12 @@ PAGE = """<!doctype html><meta charset=utf-8><title>halogen</title>
   <div class=card><h2>Profiles</h2><div id=profiles></div></div>
   <div class=card><h2>Host</h2><table id=res></table></div>
   <div class=card><h2>Server</h2><table id=srv></table></div>
+  <div class=card><h2>History</h2><div id=hist></div></div>
  </div>
- <div class=card><h2>Log <span id=logname style="color:#55607a"></span></h2><pre id=log>—</pre></div>
+ <div>
+  <div class=card><h2>Log <span id=logname style="color:#55607a"></span></h2><pre id=log>—</pre></div>
+  <div class=card id=detailcard style=display:none><h2>Run detail <span id=detname style="color:#55607a"></span></h2><div id=detail></div></div>
+ </div>
 </main>
 <script>
 let off=0, logEl=document.getElementById('log'), following=true;
@@ -325,6 +619,12 @@ async function tick(){
     row('disk records', (c.disk&&c.disk.records)??'—');
 
   document.getElementById('logname').textContent = s.logfile? ' · '+s.logfile.split('/').pop():'';
+
+  const v=s.versions||{};
+  const ve=document.getElementById('ver');
+  if(v.running){ ve.textContent='v'+v.running + (v.latest&&v.latest!==v.running?` · ${v.latest} available`:'');
+    ve.className='pill '+(v.latest&&v.latest!==v.running?'down':'up'); }
+  else { ve.textContent = v.latest? 'latest '+v.latest : ''; ve.className='pill'; }
 }
 
 async function start(name){
@@ -343,7 +643,49 @@ async function logs(){
   if(r.text){ logEl.textContent += r.text; off = r.off;
     if(following) logEl.scrollTop = logEl.scrollHeight; }
 }
-tick(); logs();
+function dur(x){ if(!x) return '—'; const m=Math.floor(x/60), h=Math.floor(m/60);
+  return h? `${h}h${m%60}m` : m? `${m}m${Math.round(x%60)}s` : Math.round(x)+'s'; }
+function when(t){ return t? new Date(t*1000).toLocaleString(undefined,
+  {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—'; }
+
+async function history(){
+  const h = await (await fetch('/api/history')).json();
+  document.getElementById('hist').innerHTML = (h.runs||[]).map(r=>`
+    <div class=run onclick="detail(${r.id})">
+      <span><b>${r.profile}</b> <span class=s>${r.checkpoint||''}</span></span>
+      <span class=t>${when(r.started_at)}</span>
+      <span class=s>${r.n_req||0} req · ${(r.tokens||0).toLocaleString()} tok${r.avg_tps?` · ${r.avg_tps} t/s`:''}${r.n_err?` · <span class=err>${r.n_err} err</span>`:''}</span>
+      <span class=t>${r.stopped_at? dur(r.duration_s) : 'running'}</span>
+    </div>`).join('') || '<div class=s>no runs yet</div>';
+}
+
+async function detail(id){
+  const d = await (await fetch('/api/run/'+id)).json();
+  if(!d.run) return;
+  const r=d.run, q=d.reqs||[], e=d.events||[];
+  const tok=q.reduce((a,x)=>a+(x.out_tokens||0),0);
+  const tps=q.length? (q.reduce((a,x)=>a+(x.tps||0),0)/q.length).toFixed(1):'—';
+  const maxp=q.reduce((a,x)=>Math.max(a,x.prompt||0),0);
+  const cachedPct=q.length? (q.reduce((a,x)=>a+(x.cached_pct||0),0)/q.length).toFixed(1):'—';
+  document.getElementById('detname').textContent = ` · #${id} ${r.profile}`;
+  document.getElementById('detailcard').style.display='';
+  document.getElementById('detail').innerHTML = `<table>
+    ${row('started', when(r.started_at))}${row('duration', dur(r.duration_s))}
+    ${row('checkpoint', r.checkpoint||'—')}${row('engine', r.engine_version||r.image_tag||'—')}
+    ${row('pool / slots', (r.pool||'—')+' / '+(r.slots||'—'))}
+    ${row('weights / held', (r.weights_gib||'—')+' / '+(r.held_gib||'—')+' GiB')}
+    ${row('pin rate', r.pin_gbs? r.pin_gbs+' GB/s':'—')}${row('pin stalls', r.pin_stalls??'—')}
+    ${row('ready after', r.ready_s? r.ready_s+' s':'—')}
+    ${row('requests', q.length)}${row('output tokens', tok.toLocaleString())}
+    ${row('mean decode', tps+' t/s')}${row('largest prompt', maxp.toLocaleString())}
+    ${row('mean cache hit', cachedPct+'%')}${row('events', e.length)}
+    </table>` +
+    (e.length? `<pre style="max-height:22vh;margin-top:10px">${e.slice(0,40).map(x=>
+      `[${x.kind}] ${x.detail}`).join('\n').replace(/</g,'&lt;')}</pre>`:'');
+}
+
+tick(); logs(); history();
+setInterval(history, 10000);
 setInterval(tick, 3000);
 setInterval(logs, 1000);
 </script>
@@ -365,6 +707,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # the page and the API are generated fresh each time; never let a
+        # browser serve a cached copy after the script has been updated
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
 
@@ -373,6 +718,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(PAGE, ctype="text/html; charset=utf-8")
         if self.path == "/api/status":
             return self._send(self.status())
+        if self.path == "/api/history":
+            return self._send({"runs": HIST.runs() if HIST else []})
+        if self.path.startswith("/api/run/"):
+            try:
+                rid = int(self.path.rsplit("/", 1)[1])
+            except ValueError:
+                return self._send({"error": "bad id"}, 400)
+            return self._send(HIST.run(rid) if HIST else {})
         if self.path.startswith("/api/logs"):
             off = 0
             if "off=" in self.path:
@@ -402,9 +755,14 @@ class Handler(BaseHTTPRequestHandler):
     def status(self) -> dict:
         port = self.script.vars.get("PORT", "8731")
         base = f"http://127.0.0.1:{port}"
-        health = http_json(base + "/health")
-        models = http_json(base + "/v1/models")
-        cache = http_json(base + "/cache")
+        c = container(self.script)
+        # Only probe the API when something is serving, so a stopped box does
+        # not pay three connection timeouts on every poll.
+        health = models = cache = None
+        if c:
+            health = http_json(base + "/health")
+            models = http_json(base + "/v1/models")
+            cache = http_json(base + "/cache")
         profs = []
         for p in self.script.profiles:
             missing = [r for r in self.script.requirements(p) if not Path(r).exists()]
@@ -415,7 +773,7 @@ class Handler(BaseHTTPRequestHandler):
             launching = bool(STATE["proc"] and STATE["proc"].poll() is None)
             prof, lf = STATE["profile"], STATE["logfile"]
         return {
-            "container": container(self.script),
+            "container": c,
             "launching": launching,
             "profile": prof,
             "logfile": lf,
@@ -424,6 +782,7 @@ class Handler(BaseHTTPRequestHandler):
             "cache": cache or {},
             "resources": resources(),
             "profiles": profs,
+            "versions": versions(self.script, (c or {}).get("image")),
         }
 
     def logs(self, off: int) -> dict:
@@ -446,18 +805,52 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("--logdir", default="~/.halogen-ui/logs")
+    ap.add_argument("--db", default="~/.halogen-ui/history.db")
     a = ap.parse_args()
 
     sp = Path(a.script).expanduser().resolve()
     if not sp.exists():
         raise SystemExit(f"no such script: {sp}")
+    global HIST
+    HIST = History(Path(a.db).expanduser())
     Handler.script = Script(sp)
     Handler.logdir = Path(a.logdir).expanduser()
     Handler.port = a.port
 
     print(f"halogen-ui on http://{a.host}:{a.port}  (script {sp})")
     print(f"  profiles: {', '.join(p['name'] for p in Handler.script.profiles)}")
-    ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
+    print(f"  history:  {Path(a.db).expanduser()}")
+    if a.host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"  WARNING: bound to {a.host}, so it is reachable from the network. "
+              f"This UI starts and stops containers and has no authentication.")
+
+    srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    srv.daemon_threads = True
+
+    def shutdown(signum=None, frame=None):
+        # The container is deliberately left running: this is a console, not a
+        # supervisor. The open run row is closed so history shows no phantom.
+        print("\nshutting down (the halogen container is left running)", flush=True)
+        with LOCK:
+            if STATE.get("stop_evt"):
+                STATE["stop_evt"].set()
+            if HIST and STATE.get("run_id"):
+                time.sleep(1.0)              # let the watcher drain the log tail
+                HIST.end(STATE["run_id"], "ui exited, server left running")
+        try:
+            if HIST:
+                HIST.db.close()
+        except Exception:
+            pass
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        shutdown()
+    finally:
+        srv.server_close()
 
 
 if __name__ == "__main__":
