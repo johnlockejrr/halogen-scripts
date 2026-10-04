@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
 # halogen.sh — run latest halogen-flash-server, prune old images
+# To allow this specific command to run without a password while
+# keeping password prompts for all other sudo commands, you need
+# to add a highly specific rule to your sudoers configuration.
+# ```bash
+# sudo visudo -f /etc/sudoers.d/compact_memory
+# ```
+# your_username ALL=(root) NOPASSWD: /usr/sbin/sysctl -q vm.compact_memory=1
+#
+# sudo -k
+#
+# sudo /usr/sbin/sysctl -q vm.compact_memory=1
 set -euo pipefail
 
 REGISTRY="ghcr.io"
@@ -73,8 +84,12 @@ compact_memory() {
   local before after
   before=$(awk '/Normal/{print $14; exit}' /proc/buddyinfo)
   sync
-  sudo sysctl -q vm.compact_memory=1 2>/dev/null || {
-    echo "compaction skipped (no sudo); order-9 blocks: ${before:-?}" >&2
+  # -n so it fails immediately instead of waiting on a password prompt; the UI
+  # has no terminal to answer one. Grant with:
+  #   /etc/sudoers.d/compact_memory
+  #   <user> ALL=(root) NOPASSWD: /usr/sbin/sysctl -q vm.compact_memory=1
+  sudo -n sysctl -q vm.compact_memory=1 2>/dev/null || {
+    echo "compaction skipped (no passwordless sudo); order-9 blocks: ${before:-?}" >&2
     return 0
   }
   sleep 3
