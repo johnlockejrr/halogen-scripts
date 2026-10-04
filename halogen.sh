@@ -1,16 +1,6 @@
 #!/usr/bin/env bash
 # halogen.sh — run latest halogen-flash-server, prune old images
-# To allow this specific command to run without a password while
-# keeping password prompts for all other sudo commands, you need
-# to add a highly specific rule to your sudoers configuration.
-# ```bash
-# sudo visudo -f /etc/sudoers.d/compact_memory
-# ```
-# your_username ALL=(root) NOPASSWD: /usr/sbin/sysctl -q vm.compact_memory=1
 #
-# sudo -k
-#
-# sudo /usr/sbin/sysctl -q vm.compact_memory=1
 set -euo pipefail
 
 REGISTRY="ghcr.io"
