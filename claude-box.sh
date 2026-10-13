@@ -64,6 +64,7 @@ exec podman run --rm -it \
   -e CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384 \
   -e API_TIMEOUT_MS=1800000 \
   -e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+  -e CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 \
   -e DISABLE_TELEMETRY=1 \
   -e GIT_AUTHOR_NAME="$(git config --get user.name 2>/dev/null || echo dev)" \
   -e GIT_AUTHOR_EMAIL="$(git config --get user.email 2>/dev/null || echo dev@localhost)" \
