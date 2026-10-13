@@ -11,6 +11,12 @@
 # sudo -k
 #
 # sudo /usr/sbin/sysctl -q vm.compact_memory=1
+# -- ADD API KEY
+# umask 077
+# mkdir -p ~/.config/halogen
+# printf '%s' "hal-$(openssl rand -hex 24)" > ~/.config/halogen/api-key
+# cat ~/.config/halogen/api-key; echo
+#
 set -euo pipefail
 
 REGISTRY="ghcr.io"
@@ -19,9 +25,10 @@ IMAGE="${REGISTRY}/${REPO}"
 MODEL_DIR="/mnt/data/models/halogen-qwen3.8-flash-next"
 CACHE_DIR="/mnt/data/halogen-cache"
 PORT=8731
-HOST=0.0.0.0
-KEEP_TAGS="${KEEP_TAGS:-0.15.3}"
+#KEEP_TAGS="${KEEP_TAGS:-0.15.3}"
+KEEP_TAGS=""
 XRT_LIB_DIR="${XRT_LIB_DIR:-/usr/lib/x86_64-linux-gnu}"
+API_KEY_FILE="${HALOGEN_API_KEY_FILE:-$HOME/.config/halogen/api-key}"
 
 xrt_mounts() {
   local f real
@@ -124,8 +131,15 @@ clean() {
   podman image prune -f >/dev/null
 }
 
+api_key_args() {
+  [[ -r "$API_KEY_FILE" ]] || return 0
+  printf '%s\n' -v "${API_KEY_FILE}:/run/halogen-api-key:ro" -e HALOGEN_API_KEY_FILE=/run/halogen-api-key
+}
+
 run() {
   local tag="$1"; shift
+  local -a key_args
+  mapfile -t key_args < <(api_key_args)
 
   compact_memory
 
@@ -140,6 +154,7 @@ run() {
 
 # Shared agent-tuned settings; the pool is passed in so the vision variant can
 # ask for less (the tower needs host RAM the pool would otherwise take).
+# Was: HALOGEN_MAX_TOKENS_CAP=32768 - changed for Claude
 optimal_env() {
   local pool="$1"
   printf '%s\n' \
@@ -155,7 +170,7 @@ optimal_env() {
     -e HALOGEN_COMPOSABLE_CONTEXT=1 \
     -e HALOGEN_TEMPERATURE=1.0 \
     -e HALOGEN_MAX_TOKENS_DEFAULT=16384 \
-    -e HALOGEN_MAX_TOKENS_CAP=32768 \
+    -e HALOGEN_MAX_TOKENS_CAP=16384 \
     -e HALOGEN_REASONING_EFFORT=medium \
     -e HALOGEN_MAX_THINKING_TOKENS=8192 \
     -e HALOGEN_ENGINE_WATCHDOG_S=0 \
@@ -202,8 +217,8 @@ run_abliterated() {
   run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}" \
     -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2-abliterated.hgn \
     -e HALOGEN_NGRAM_TABLE=/models/qwen38-flash-next-ngram.hgn \
-    -e HALOGEN_MODEL_ID=halogen-qwen3.8-flash-next \
     -e HALOGEN_VISION_TOWER=1 \
+    -e HALOGEN_MODEL_ID=halogen-qwen3.8-flash-next \
     -e HALOGEN_VISION_MAX_PIXELS=2073600
 }
 
