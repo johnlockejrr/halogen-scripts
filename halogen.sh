@@ -234,19 +234,6 @@ run_swift_abliterated() {
     -e HALOGEN_VISION_MAX_PIXELS=2073600
 }
 
-run_blackfrost() {
-  mkdir -p "${CACHE_DIR}"
-  mapfile -t env_args < <(optimal_env 786432)
-  run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}" \
-    -e HALOGEN_CHECKPOINT=/models/blackfrost/model.hgn \
-    -e HALOGEN_NGRAM_TABLE=/models/blackfrost/qwen38-flash-next-ngram.hgn \
-    -e HALOGEN_VISION_TOWER=/models/blackfrost/qwen38-flash-next-vision.hgn \
-    -e HALOGEN_TOKENIZER=/models/blackfrost/tokenizer \
-    -e HALOGEN_MODEL_ID=halogen-qwen3.8-flash-next \
-    -e HALOGEN_TEMPLATE_UNCHECKED=1 \
-    -e HALOGEN_VISION_MAX_PIXELS=2073600
-}
-
 run_optimal_npu() {
   mkdir -p "${CACHE_DIR}"
   require_npu
@@ -310,9 +297,6 @@ case "${1:-run}" in
   run-swift-abliterated)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (swift abliterated)" >&2; clean "$tag"
     run_swift_abliterated "$tag" ;;
-  run-blackfrost)
-    tag=$(resolve); echo "using ${IMAGE}:${tag} (blackfrost)" >&2; clean "$tag"
-    run_blackfrost "$tag" ;;
   run-optimal-npu)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal + npu)" >&2; clean "$tag"
     run_optimal_npu "$tag" ;;
@@ -324,5 +308,5 @@ case "${1:-run}" in
     run_optimal_npu_ht43 "$tag" ;;
   clean)  tag=$(resolve); clean "$tag" ;;
   latest) resolve ;;
-  *)      echo "usage: $0 [run|run-optimal|run-optimal-slots8|run-optimal-vision|run-optimal-fork|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-abliterated|run-swift-abliterated|run-blackfrost|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
+  *)      echo "usage: $0 [run|run-optimal|run-optimal-slots8|run-optimal-vision|run-optimal-fork|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-abliterated|run-swift-abliterated|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
 esac
