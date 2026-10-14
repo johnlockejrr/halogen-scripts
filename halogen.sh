@@ -148,6 +148,7 @@ run() {
     --device /dev/kfd --device /dev/dri --group-add keep-groups \
     --ipc=host --ulimit memlock=-1:-1 \
     -v "${MODEL_DIR}:/models:ro" \
+    "${key_args[@]}" \
     "$@" \
     "${IMAGE}:${tag}"
 }
@@ -206,7 +207,7 @@ run_optimal_vision() {
 run_optimal_fork() {
   mkdir -p "${CACHE_DIR}-fork"
   mapfile -t env_args < <(optimal_env 786432)
-  run "$1" -v "${CACHE_DIR}-fork:/cache" "${env_args[@]}" \
+  run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}" \
     -e HALOGEN_FORK=1 \
     -e HALOGEN_FORK_MAP=claude-code
 }
@@ -216,6 +217,17 @@ run_abliterated() {
   mapfile -t env_args < <(optimal_env 786432)
   run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}" \
     -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2-abliterated.hgn \
+    -e HALOGEN_NGRAM_TABLE=/models/qwen38-flash-next-ngram.hgn \
+    -e HALOGEN_VISION_TOWER=1 \
+    -e HALOGEN_MODEL_ID=halogen-qwen3.8-flash-next \
+    -e HALOGEN_VISION_MAX_PIXELS=2073600
+}
+
+run_swift_abliterated() {
+  mkdir -p "${CACHE_DIR}"
+  mapfile -t env_args < <(optimal_env 786432)
+  run "$1" -v "${CACHE_DIR}:/cache" "${env_args[@]}" \
+    -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2-swift15-abliterated.hgn \
     -e HALOGEN_NGRAM_TABLE=/models/qwen38-flash-next-ngram.hgn \
     -e HALOGEN_VISION_TOWER=1 \
     -e HALOGEN_MODEL_ID=halogen-qwen3.8-flash-next \
@@ -295,6 +307,9 @@ case "${1:-run}" in
   run-abliterated)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (abliterated)" >&2; clean "$tag"
     run_abliterated "$tag" ;;
+  run-swift-abliterated)
+    tag=$(resolve); echo "using ${IMAGE}:${tag} (swift abliterated)" >&2; clean "$tag"
+    run_swift_abliterated "$tag" ;;
   run-blackfrost)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (blackfrost)" >&2; clean "$tag"
     run_blackfrost "$tag" ;;
@@ -309,5 +324,5 @@ case "${1:-run}" in
     run_optimal_npu_ht43 "$tag" ;;
   clean)  tag=$(resolve); clean "$tag" ;;
   latest) resolve ;;
-  *)      echo "usage: $0 [run|run-optimal|run-optimal-slots8|run-optimal-vision|run-optimal-fork|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-abliterated|run-blackfrost|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
+  *)      echo "usage: $0 [run|run-optimal|run-optimal-slots8|run-optimal-vision|run-optimal-fork|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-abliterated|run-swift-abliterated|run-blackfrost|clean|latest]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
 esac
