@@ -37,7 +37,7 @@ claude
 ```
 usage: ./halogen.sh [run|run-optimal|run-optimal-vision|run-optimal-npu
                     |run-optimal-ht43|run-optimal-npu-ht43|run-optimal-slots8
-                    |run-optimal-fork|run-abliterated|run-blackfrost|clean|latest]
+                    |run-optimal-fork|run-abliterated|run-swift-abliterated|clean|latest]
                     (VERSION=x.y.z to pin)
 ```
 
@@ -52,7 +52,7 @@ usage: ./halogen.sh [run|run-optimal|run-optimal-vision|run-optimal-npu
 | `run-optimal-slots8` | v2 | 786432 | 8 KV slots — for heavy subagent fan-out |
 | `run-optimal-fork` | v2 | 786432 | Claude Code sessions (0.18.1+), own cache dir — see [Sessions](#sessions-0181-opt-in) |
 | `run-abliterated` | abliterated v2 | 786432 | vision |
-| `run-blackfrost` | blackfrost (own checkpoint, n-gram table, vision tower, tokenizer) | 786432 | served as `halogen-qwen3.8-flash-next`; the chat-template probe is bypassed (`HALOGEN_TEMPLATE_UNCHECKED=1`), so check `/health.chat_template` — thinking controls may not apply |
+| `run-swift-abliterated` | swift1.5 abliterated v2 | 786432 | served as `halogen-qwen3.8-flash-next`; the chat-template probe is bypassed (`HALOGEN_TEMPLATE_UNCHECKED=1`), so check `/health.chat_template` — thinking controls may not apply |
 
 The tag is resolved from GHCR each run, falling back to the newest local image if the
 registry is unreachable. `VERSION=0.15.3 ./halogen.sh run-optimal` pins it, and
