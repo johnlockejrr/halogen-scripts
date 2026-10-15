@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -341,13 +342,57 @@ class Script:
             if not fn:
                 continue
             fname = fn.group(1)
-            info = self.describe(fname)
+            info = self.describe(fname, label)
             info["name"] = label
             info["fn"] = fname
             out.append(info)
         return out
 
-    def describe(self, fname: str) -> dict:
+    # A script that has a --dry-run option can say exactly what a profile starts. An older
+    # script would IGNORE the flag and start a server, so this is used only when the script's
+    # own text mentions it.
+    @property
+    def can_dry_run(self) -> bool:
+        return "--dry-run" in self.text
+
+    def dry_run(self, label: str):
+        """(environment, mounts) the profile would pass to the container, or None."""
+        if not self.can_dry_run:
+            return None
+        try:
+            r = subprocess.run(
+                ["bash", str(self.path), label, "--dry-run"], capture_output=True, text=True,
+                timeout=20, cwd=str(self.path.parent),
+                env=dict(os.environ, VERSION="0.0.0"))      # pinned: no registry lookup
+            if r.returncode != 0 or not r.stdout.startswith("podman run"):
+                return None
+            toks = shlex.split(r.stdout.replace("\\\n", " "))
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        env, mounts, i = {}, [], 0
+        while i < len(toks):
+            if toks[i] == "-e" and i + 1 < len(toks):
+                k, _, v = toks[i + 1].partition("=")
+                env[k] = v
+                i += 2
+            elif toks[i] == "-v" and i + 1 < len(toks):
+                mounts.append(toks[i + 1])
+                i += 2
+            else:
+                i += 1
+        return env, mounts
+
+    def describe(self, fname: str, label: str = "") -> dict:
+        got = self.dry_run(label) if label else None
+        if got:
+            env = {k: v for k, v in got[0].items() if k.startswith("HALOGEN_")}
+            for m in got[1]:                      # the script knows its own directories
+                host, _, rest = m.partition(":")
+                if rest.startswith("/models"):
+                    self.vars["MODEL_DIR"] = host
+                elif rest.startswith("/cache"):
+                    self.vars["CACHE_DIR"] = host
+            return self._info(env)
         body = self._func_body(fname) if fname != "run" else ""
         env = dict(re.findall(r"-e\s+(HALOGEN_[A-Z_0-9]+)=([^\s\\]+)", body))
         pool = None
@@ -358,6 +403,10 @@ class Script:
                 r"-e\s+(HALOGEN_[A-Z_0-9]+)=([^\s\\]+)",
                 self._func_body("optimal_env"))))
             env["HALOGEN_KV_POOL_POSITIONS"] = str(pool)
+        return self._info(env)
+
+    @staticmethod
+    def _info(env: dict) -> dict:
         ckpt = env.get("HALOGEN_CHECKPOINT", "")
         npu = env.get("HALOGEN_NPU_MODELS", "")
         return {

@@ -35,24 +35,78 @@ claude
 ## `halogen.sh`
 
 ```
-usage: ./halogen.sh [run|run-optimal|run-optimal-vision|run-optimal-npu
-                    |run-optimal-ht43|run-optimal-npu-ht43|run-optimal-slots8
-                    |run-optimal-fork|run-abliterated|run-swift-abliterated|clean|latest]
-                    (VERSION=x.y.z to pin)
+usage: ./halogen.sh <recipe> [options]          VERSION=x.y.z pins the image tag
+recipes: run | serve | run-optimal | run-optimal-slots8 | run-optimal-vision
+         run-optimal-fork | run-abliterated | run-swift-abliterated
+         run-optimal-npu | run-optimal-ht43 | run-optimal-npu-ht43
+other:   clean | latest | list | config | help
 ```
 
-| profile | checkpoint | pool | extras |
-|---|---|---|---|
-| `run` | default | default | nothing tuned |
-| **`run-optimal`** | v2 | 786432 | **the one to use** |
-| `run-optimal-vision` | v2 | 786432 | vision tower, 1080p cap |
-| `run-optimal-npu` | v2 | 524288 | vision + 5 NPU models |
-| `run-optimal-ht43` | ht43 | 786432 | the smaller checkpoint |
-| `run-optimal-npu-ht43` | ht43 | 786432 | both |
-| `run-optimal-slots8` | v2 | 786432 | 8 KV slots — for heavy subagent fan-out |
-| `run-optimal-fork` | v2 | 786432 | Claude Code sessions (0.18.1+), own cache dir — see [Sessions](#sessions-0181-opt-in) |
-| `run-abliterated` | abliterated v2 | 786432 | vision |
-| `run-swift-abliterated` | swift1.5 abliterated v2 | 786432 | served as `halogen-qwen3.8-flash-next`; the chat-template probe is bypassed (`HALOGEN_TEMPLATE_UNCHECKED=1`), so check `/health.chat_template` — thinking controls may not apply |
+A recipe is a starting point, not a fixed thing: every option below overrides what a recipe
+implies. Anything that was a recipe can also be composed.
+
+| recipe | model | vision | NPU | slots | pool |
+|---|---|---|---|---|---|
+| `run` | server default | no | no | server default | server default — **nothing tuned** |
+| `serve` / **`run-optimal`** | v2 | no | no | 4 | 786432 — **the one to use** |
+| `run-optimal-slots8` | v2 | no | no | **8** | 786432 |
+| `run-optimal-vision` | v2 | **yes** | no | 4 | 786432 |
+| `run-optimal-fork` | v2 | no | no | 4 | 786432, Claude Code sessions (0.18.1+), see [Sessions](#sessions-0181-opt-in) |
+| `run-abliterated` | abliterated v2 | yes | no | 4 | 786432 |
+| `run-swift-abliterated` | swift15 abliterated | yes | no | 4 | 786432 |
+| `run-optimal-npu` | v2 | yes | **yes** | 4 | **524288** |
+| `run-optimal-ht43` | ht43 | no | no | 4 | 786432 |
+| `run-optimal-npu-ht43` | ht43 | no | **yes** | 4 | 786432 |
+
+### Composing a configuration
+
+```bash
+./halogen.sh run-optimal --vision on                    # a recipe plus one feature
+./halogen.sh serve --model swift15 --vision off --slots 8
+./halogen.sh run-optimal-fork --model abliterated --effort xhigh
+./halogen.sh serve --set HALOGEN_MTP_PREFILL=1 --cache-dir /mnt/data/halogen-cache-test
+./halogen.sh run-optimal --dry-run                      # print the podman command, start nothing
+```
+
+| option | meaning |
+|---|---|
+| `--model NAME` | `v2`, `ht43`, `abliterated`, `swift15`, or one you added (`./halogen.sh list`) |
+| `--vision on\|off` | the vision tower |
+| `--npu on\|off` | the NPU models (needs the driver, XRT and the fabric-clock unit) |
+| `--fork on\|off` | Claude Code sessions |
+| `--slots N`, `--pool N` | concurrent conversations, KV pool positions |
+| `--effort LEVEL` | the server's default reasoning effort |
+| `--cache-dir PATH` | prompt cache directory (default: the main one) |
+| `--set NAME=VALUE` | any container variable; repeatable; applied last, so it wins |
+| `-n`, `--dry-run` | print the command; no pull, no prune, no compaction |
+
+`--dry-run` is also the quickest way to see what a recipe really does. With `VERSION` set it
+touches nothing; without it, it makes one read-only `podman images` call to find the local tag.
+Combinations the recipes never covered are just flags; they are not all tested on hardware, and
+a bigger pool with vision or the NPU can run out of host memory (the server's own pre-flight
+warns before it fails). The NPU recipe uses a smaller pool for that reason; `--npu on` alone does
+not change the pool.
+
+### Configuration
+
+Paths, models and tuning are variables in one block at the top of the script. To keep them when
+you replace the script, put overrides in `~/.config/halogen/halogen.conf` (or the file named by
+`$HALOGEN_SH_CONFIG`); it is plain bash, read after the defaults:
+
+```bash
+MODEL_DIR=/srv/models/halogen
+CACHE_DIR=/srv/halogen-cache
+MODEL_FILE[mine]="my-finetune.hgn"        # then: ./halogen.sh serve --model mine
+KV_SLOTS=6
+```
+
+Precedence, highest first: **flags, environment, config file, defaults**. The environment
+variables that count are `REGISTRY`, `REPO`, `PORT`, `KEEP_TAGS`, `MODEL_DIR`, `CACHE_DIR` and
+`XRT_LIB_DIR`, plus `VERSION`. `./halogen.sh config` prints the resolved values and says whether
+the config file and the API-key file were found.
+
+This makes the *paths and models* portable. It is still written for rootless **podman** and an AMD
+GPU (`/dev/kfd`, `/dev/dri`, `--group-add keep-groups`); it needs bash 4.4 or newer.
 
 The tag is resolved from GHCR each run, falling back to the newest local image if the
 registry is unreachable. `VERSION=0.15.3 ./halogen.sh run-optimal` pins it, and
@@ -208,11 +262,12 @@ which is what the mapping reads. Use the profile:
 ./halogen.sh run-optimal-fork
 ```
 
-It uses its own cache directory (`${CACHE_DIR}-fork`). A changed engine configuration changes
-the cache fingerprint (it did for the vision tower, and the fork flag may too), and
-`HALOGEN_CACHE_PRUNE_OLD=1` would then delete the `run-optimal` cache. Names are released after 10 minutes unused, at most 8 live at once
-(`HALOGEN_FORK_TTL_S`, `HALOGEN_FORK_HANDLES`), and survive a restart when
-`HALOGEN_CACHE_DIR` is set.
+It shares the main cache directory by default. A changed engine configuration changes the
+cache fingerprint (it did for the vision tower, and the fork flag may too), and
+`HALOGEN_CACHE_PRUNE_OLD=1` would then delete the `run-optimal` cache; to keep them apart, add
+`--cache-dir "$CACHE_DIR-fork"` (create the directory first or let the script do it). Names are
+released after 10 minutes unused, at most 8 live at once (`HALOGEN_FORK_TTL_S`,
+`HALOGEN_FORK_HANDLES`), and survive a restart when `HALOGEN_CACHE_DIR` is set.
 
 **Status: not yet measured here.** The behaviour is from the 0.18.1 changelog and README. A
 useful test is a subagent-heavy task with the flag off and on, comparing the cached
