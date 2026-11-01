@@ -54,6 +54,8 @@ implies. Anything that was a recipe can also be composed.
 | `run-optimal-fork` | v2 | no | no | 4 | 786432, Claude Code sessions (0.18.1+), see [Sessions](#sessions-0181-opt-in) |
 | `run-abliterated` | abliterated v2 | yes | no | 4 | 786432 |
 | `run-swift-abliterated` | swift15 abliterated | yes | no | 4 | 786432 |
+| `run-signal` | Signal v2 abliterated | yes | no | 4 | 786432 |
+| `run-heretic` | Heretic Reverse Engineering v2 | yes | no | 4 | 786432 |
 | `run-optimal-npu` | v2 | yes | **yes** | 4 | **524288** |
 | `run-optimal-ht43` | ht43 | no | no | 4 | 786432 |
 | `run-optimal-npu-ht43` | ht43 | no | **yes** | 4 | 786432 |
