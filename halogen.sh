@@ -54,7 +54,7 @@ REGISTRY="ghcr.io"
 REPO="peonist-ai/halogen-flash-server"
 PORT=8731
 # comma-separated tags `clean` must keep besides the current one
-KEEP_TAGS=""
+KEEP_TAGS="0.18.14-flint-preview"
 
 # --- where things live -----------------------------------------------------
 # MODEL_DIR is mounted at /models, CACHE_DIR at /cache; XRT is for the NPU only; the API
@@ -69,19 +69,43 @@ API_KEY_FILE="$HOME/.config/halogen/api-key"
 # config file with MODEL_FILE[name]="file.hgn".
 NGRAM_FILE="qwen38-flash-next-ngram.hgn"
 SERVED_MODEL_ID="halogen-qwen3.8-flash-next"    # the name clients see
+SIGNAL_DIR="Signal-3.8-Flash-Next-HGN-v2-abliterated"
+HERETIC_DIR="Swift-1.5-Flash-Next-Heretic-V2-HGN"
 declare -A MODEL_FILE=(
   [v2]=""
   [ht43]="qwen38-flash-next-ht43.hgn"
   [abliterated]="qwen38-flash-next-v2-abliterated.hgn"
   [swift15]="qwen38-flash-next-v2-swift15-abliterated.hgn"
+  [signal]="${SIGNAL_DIR}/model.hgn"
+  [heretic]="${HERETIC_DIR}/model.hgn"
 )
-# Models that also pin NGRAM_FILE and are served as SERVED_MODEL_ID, as the old recipes did.
-MODELS_PINNED=" abliterated swift15 "
+# Optional per-model overrides, also relative to MODEL_DIR. A model that ships as a bundle keeps
+# its own n-gram table, vision tower and tokenizer beside its checkpoint; the others share the
+# files in MODEL_DIR (NGRAM_FILE, VISION_TOWER, and the tokenizer the server finds on its own).
+declare -A MODEL_NGRAM=(
+  [signal]="${SIGNAL_DIR}/qwen38-flash-next-ngram.hgn"
+  [heretic]="${HERETIC_DIR}/qwen38-flash-next-ngram.hgn"
+)
+declare -A MODEL_VISION=(
+  [signal]="${SIGNAL_DIR}/qwen38-flash-next-vision.hgn"
+  [heretic]="${HERETIC_DIR}/qwen38-flash-next-vision.hgn"
+)
+declare -A MODEL_TOKENIZER=(
+  [signal]="${SIGNAL_DIR}/tokenizer"
+  [heretic]="${HERETIC_DIR}/tokenizer"
+)
+# Models that also pin an n-gram table and are served as SERVED_MODEL_ID, as the old recipes did.
+MODELS_PINNED=" abliterated swift15 signal heretic "
 
 # --- optional features -------------------------------------------------------
 VISION_TOWER="1"              # 1 = the sidecar beside the checkpoint; or /models/<file>
 VISION_MAX_PIXELS=2073600     # 1080p; a 1440p image costs about twice the prefill time
-NPU_MODELS="qwen3-embedding-0.6b,qwen3-reranker-0.6b,decider-0.8b,qwen3guard-gen-0.6b,qwen3.5-2b"
+NPU_MODELS="d1-2b,d3-lite,d3-nano,decider-0.8b,decider-4b,embeddinggemma-2,"
+NPU_MODELS+="flux2-klein-4b,lfm3-1.7b,lfm3-1.7b-fast,qwen3guard-gen-0.6b,"
+NPU_MODELS+="qwen3guard-stream-0.6b,qwen3-asr-0.6b,qwen3-asr-1.7b,"
+NPU_MODELS+="qwen3-embedding-0.6b,qwen3-embedding-4b,qwen3-reranker-0.6b,"
+NPU_MODELS+="qwen3-reranker-4b,qwen3-tts-0.6b-customvoice,"
+NPU_MODELS+="qwen3-tts-1.7b-customvoice,qwen3.5-2b,qwen3.8-27b,wemm-embedding-4b"
 FORK_MAP="claude-code"        # HALOGEN_FORK_MAP when --fork on
 
 # --- engine tuning (what run-optimal measured best; see README) -------------
@@ -270,7 +294,7 @@ engine_env() {
     -e "HALOGEN_MAX_TOK=${MAX_TOK}" \
     -e "HALOGEN_HOST_RESERVE_GIB=${HOST_RESERVE_GIB}" \
     -e "HALOGEN_CACHE_BRANCHES=${CACHE_BRANCHES}" \
-    -e HALOGEN_COMPOSABLE_CONTEXT=1 \
+    -e HALOGEN_COMPOSABLE_CONTEXT=0 \
     -e "HALOGEN_TEMPERATURE=${TEMPERATURE}" \
     -e "HALOGEN_MAX_TOKENS_DEFAULT=${MAX_TOKENS_DEFAULT}" \
     -e "HALOGEN_MAX_TOKENS_CAP=${MAX_TOKENS_CAP}" \
@@ -287,7 +311,7 @@ engine_env() {
 # Assemble the podman arguments (everything after `podman run --rm`) into the array CMDLINE.
 # $1 = image tag, $2 = "stock" for the untuned profile.
 build_cmdline() {
-  local tag="$1" mode="${2:-tuned}" cache f
+  local tag="$1" mode="${2:-tuned}" cache f vt
   local -a xrt_args key_args env_args
 
   if [[ "$mode" == "stock" ]]; then
@@ -322,10 +346,15 @@ build_cmdline() {
     f="${MODEL_FILE[$MODEL]}"
     [[ -n "$f" ]] && CMDLINE+=(-e "HALOGEN_CHECKPOINT=/models/${f}")
     if [[ "$MODELS_PINNED" == *" $MODEL "* ]]; then
-      CMDLINE+=(-e "HALOGEN_NGRAM_TABLE=/models/${NGRAM_FILE}" -e "HALOGEN_MODEL_ID=${SERVED_MODEL_ID}")
+      CMDLINE+=(-e "HALOGEN_NGRAM_TABLE=/models/${MODEL_NGRAM[$MODEL]:-$NGRAM_FILE}" -e "HALOGEN_MODEL_ID=${SERVED_MODEL_ID}")
     fi
+    [[ -n "${MODEL_TOKENIZER[$MODEL]:-}" ]] && CMDLINE+=(-e "HALOGEN_TOKENIZER=/models/${MODEL_TOKENIZER[$MODEL]}")
     [[ "$NPU" == on ]]    && CMDLINE+=(-e "HALOGEN_NPU_MODELS=${NPU_MODELS}")
-    [[ "$VISION" == on ]] && CMDLINE+=(-e "HALOGEN_VISION_TOWER=${VISION_TOWER}" -e "HALOGEN_VISION_MAX_PIXELS=${VISION_MAX_PIXELS}")
+    if [[ "$VISION" == on ]]; then
+      vt="$VISION_TOWER"
+      [[ -n "${MODEL_VISION[$MODEL]:-}" ]] && vt="/models/${MODEL_VISION[$MODEL]}"
+      CMDLINE+=(-e "HALOGEN_VISION_TOWER=${vt}" -e "HALOGEN_VISION_MAX_PIXELS=${VISION_MAX_PIXELS}")
+    fi
     [[ "$FORK" == on ]]   && CMDLINE+=(-e HALOGEN_FORK=1 -e "HALOGEN_FORK_MAP=${FORK_MAP}")
   fi
 
@@ -337,8 +366,16 @@ launch() {   # launch <tag> [stock]
   local -a CMDLINE=()
   build_cmdline "$@"
   if (( DRY )); then
+    local -a a=("${CMDLINE[@]}")
+    local i=0
     printf 'podman run --rm'
-    printf ' \\\n    %q' "${CMDLINE[@]}"
+    while (( i < ${#a[@]} )); do                  # a flag and its value share a line
+      case "${a[i]}" in
+        -p|-v|-e|--device|--group-add|--ulimit)
+          printf ' \\\n    %q %q' "${a[i]}" "${a[i+1]}"; i=$((i + 2)) ;;
+        *) printf ' \\\n    %q' "${a[i]}"; i=$((i + 1)) ;;
+      esac
+    done
     printf '\n'
     return 0
   fi
@@ -388,6 +425,16 @@ run_swift_abliterated() {
   launch "$1"
 }
 
+run_signal() {
+  : "${MODEL:=signal}" "${VISION:=on}"
+  launch "$1"
+}
+
+run_heretic() {
+  : "${MODEL:=heretic}" "${VISION:=on}"
+  launch "$1"
+}
+
 run_optimal_npu() {
   : "${NPU:=on}" "${VISION:=on}" "${POOLV:=$NPU_POOL}"
   launch "$1"
@@ -422,6 +469,8 @@ recipes (the old names; options below override what a recipe implies):
   run-optimal-fork    ... with Claude Code sessions (HALOGEN_FORK)
   run-abliterated     abliterated v2 + vision
   run-swift-abliterated   swift15 abliterated + vision
+  run-signal          Signal v2 abliterated bundle + vision (its own n-gram, tower, tokenizer)
+  run-heretic         Heretic Reverse Engineering v2 abliterated bundle + vision (its own n-gram, tower, tokenizer)
   run-optimal-npu     NPU models + vision, pool ${NPU_POOL}
   run-optimal-ht43    the ht43 checkpoint
   run-optimal-npu-ht43    ht43 + NPU models
@@ -491,6 +540,12 @@ case "${CMD:-run}" in
   run-swift-abliterated)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (swift abliterated)" >&2; clean "$tag"
     run_swift_abliterated "$tag" ;;
+  run-signal)
+    tag=$(resolve); echo "using ${IMAGE}:${tag} (signal)" >&2; clean "$tag"
+    run_signal "$tag" ;;
+  run-heretic)
+    tag=$(resolve); echo "using ${IMAGE}:${tag} (heretic)" >&2; clean "$tag"
+    run_heretic "$tag" ;;
   run-optimal-npu)
     tag=$(resolve); echo "using ${IMAGE}:${tag} (optimal + npu)" >&2; clean "$tag"
     run_optimal_npu "$tag" ;;
@@ -502,5 +557,5 @@ case "${CMD:-run}" in
     run_optimal_npu_ht43 "$tag" ;;
   clean)  tag=$(resolve); clean "$tag" ;;
   latest) resolve ;;
-  *)      echo "usage: $0 [run|serve|run-optimal|run-optimal-slots8|run-optimal-vision|run-optimal-fork|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-abliterated|run-swift-abliterated|clean|latest|list|config|help] [options]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
+  *)      echo "usage: $0 [run|serve|run-optimal|run-optimal-slots8|run-optimal-vision|run-optimal-fork|run-optimal-npu|run-optimal-ht43|run-optimal-npu-ht43|run-abliterated|run-swift-abliterated|run-signal|run-heretic|clean|latest|list|config|help] [options]   (VERSION=x.y.z to pin)" >&2; exit 1 ;;
 esac
